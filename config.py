@@ -19,7 +19,7 @@ class BotConfig:
     # Default False so the bot behaves like a typical live EA:
     # it trades the strategy signals directly. Turn this on if you want
     # the optimizer to gate trading (LIVE/NO_EDGE).
-    auto_calibrate: bool = False
+    auto_calibrate: bool = False  # Disable to allow immediate trading
     calibration_candles: int = 2500
     calibration_every_minutes: int = 15
     min_trades_for_edge: int = 2  # Lower minimum for more flexibility
@@ -30,8 +30,8 @@ class BotConfig:
     # Strategy params
     rsi_period: int = 14
     ema_period: int = 100  # Reduced from 200 for faster signals
-    rsi_buy: float = 50.0  # Further relaxed for current XRPUSD conditions
-    rsi_sell: float = 55.0  # Further relaxed for current XRPUSD conditions
+    rsi_buy: float = 25.0  # More aggressive for XRPUSD volatility
+    rsi_sell: float = 75.0  # More aggressive for XRPUSD volatility
 
     # Risk / execution
     risk_per_trade: float = 0.01  # 1%

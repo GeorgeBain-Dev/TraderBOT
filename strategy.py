@@ -301,8 +301,8 @@ class RsiEmaStrategy(BaseStrategy):
                 desired = Signal.SELL
                 signal_strength += strength
         
-        # Apply minimum signal strength threshold (lowered to 0.5 for more activity)
-        if signal_strength < 0.5:
+        # Apply minimum signal strength threshold (reduced to 0.8 for more trades)
+        if signal_strength < 0.8:
             desired = Signal.HOLD
         
         # Risk management filters

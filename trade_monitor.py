@@ -60,37 +60,159 @@ class OpenTrade:
         self.max_profit = max(self.max_profit, self.unrealized_pnl)
         self.max_loss = min(self.max_loss, self.unrealized_pnl)
     
-    def should_close_for_loss_protection(self) -> tuple[bool, str]:
+    def should_close_for_loss_protection(self, market_data: Dict) -> tuple[bool, str]:
         """Determine if trade should be closed to prevent losses BEFORE stop loss"""
         if self.unrealized_pnl >= 0:
             return False, "Trade is profitable"
         
-        # Loss protection criteria - MORE AGGRESSIVE
+        # Loss protection criteria with PREDICTIVE elements
         loss_amount = abs(self.unrealized_pnl)
         entry_risk = abs(self.entry_price - self.stop_loss) * self.volume * 100000 * 0.00001 * 18.5
         
-        # Close if loss exceeds 50% of initial risk (more aggressive)
-        if loss_amount > entry_risk * 0.50:
-            return True, f"Loss exceeded 50% of risk (R{loss_amount:.2f})"
+        # Get market data for prediction
+        rsi = market_data.get('rsi', 50)
+        volatility = market_data.get('volatility', 0)
+        price_position = market_data.get('price_position', 0.5)
+        resistance = market_data.get('resistance', 0)
+        support = market_data.get('support', 0)
         
-        # Close if trade is losing for more than 15 minutes and showing no recovery
-        if self.duration_minutes > 15 and self.max_profit > 0:
+        # PREDICTIVE LOSS PREVENTION
+        
+        # 1. Accelerating loss detection (momentum)
+        if self.duration_minutes > 10 and self.max_loss < 0:
+            loss_acceleration = abs(self.unrealized_pnl - self.max_loss) / max(1, self.duration_minutes)
+            if loss_acceleration > entry_risk * 0.02:  # Loss accelerating faster than 2% risk per minute
+                return True, f"Accelerating losses detected (R{loss_amount:.2f})"
+        
+        # 2. Support/Resistance breach prediction
+        if self.type == "BUY":
+            # Buy trade - check if approaching support
+            if support > 0 and self.current_price <= support * 1.002:  # Within 0.2% of support
+                return True, f"Approaching support at {support:.5f} - predictive close"
+        else:  # SELL trade
+            # Sell trade - check if approaching resistance
+            if resistance > 0 and self.current_price >= resistance * 0.998:  # Within 0.2% of resistance
+                return True, f"Approaching resistance at {resistance:.5f} - predictive close"
+        
+        # 3. Volatility spike prediction (high volatility = higher loss probability)
+        if volatility > 1.5 and loss_amount > entry_risk * 0.3:
+            return True, f"High volatility with loss - predictive close (R{loss_amount:.2f})"
+        
+        # 4. RSI extreme prediction (continuation likely)
+        if self.type == "BUY":
+            # Buy trade - RSI showing strong bearish momentum
+            if rsi < 25 and loss_amount > entry_risk * 0.25:
+                return True, f"Strong bearish RSI ({rsi:.1f}) - predictive close"
+        else:  # SELL trade
+            # Sell trade - RSI showing strong bullish momentum
+            if rsi > 75 and loss_amount > entry_risk * 0.25:
+                return True, f"Strong bullish RSI ({rsi:.1f}) - predictive close"
+        
+        # 5. Time-based probability (longer losing trades less likely to recover)
+        if self.duration_minutes > 30:
+            recovery_probability = max(0, 1 - (self.duration_minutes - 30) * 0.02)  # 2% less recovery per minute after 30
+            if recovery_probability < 0.3 and loss_amount > entry_risk * 0.4:
+                return True, f"Low recovery probability ({recovery_probability:.1%}) - predictive close"
+        
+        # Traditional loss protection (fallback)
+        
+        # Close if loss exceeds 75% of initial risk
+        if loss_amount > entry_risk * 0.75:
+            return True, f"Loss exceeded 75% of risk (R{loss_amount:.2f})"
+        
+        # Close if trade is losing for more than 25 minutes and showing no recovery
+        if self.duration_minutes > 25 and self.max_profit > 0:
             recovery_ratio = self.unrealized_pnl / self.max_profit if self.max_profit != 0 else 0
-            if recovery_ratio < -0.3:  # Lost more than 30% of max profit
+            if recovery_ratio < -0.4:  # Lost more than 40% of max profit
                 return True, f"Trade failed to recover after {self.duration_minutes} minutes"
         
-        # Close if trade is losing for more than 30 minutes
-        if self.duration_minutes > 30:
+        # Close if trade is losing for more than 45 minutes
+        if self.duration_minutes > 45:
             return True, f"Trade timeout after {self.duration_minutes} minutes"
         
         # Close if consecutive losses detected (price moving against trade)
-        if self.duration_minutes > 10 and loss_amount > entry_risk * 0.25:
+        if self.duration_minutes > 20 and loss_amount > entry_risk * 0.35:
             # Check if price is consistently moving against trade direction
-            price_trend = "negative" if (self.type == "BUY" and self.current_price < self.entry_price) else "negative"
-            if price_trend == "negative":
+            price_trend_negative = (self.type == "BUY" and self.current_price < self.entry_price) or \
+                                 (self.type == "SELL" and self.current_price > self.entry_price)
+            if price_trend_negative:
                 return True, f"Price moving against trade (R{loss_amount:.2f} loss)"
         
         return False, "No closure needed"
+    
+    def should_close_for_profit_protection(self, market_data: Dict) -> tuple[bool, str]:
+        """Analyze market conditions and close profitable trades BEFORE they turn into losses"""
+        if self.unrealized_pnl <= 0:
+            return False, "Trade is not profitable"
+        
+        # Only consider profit protection for trades with meaningful profit
+        profit_amount = self.unrealized_pnl
+        entry_value = self.entry_price * self.volume * 100000
+        profit_percent = (profit_amount / entry_value) * 100
+        
+        # Minimum profit threshold for protection (0.8% - allow more profit to build)
+        if profit_percent < 0.8:
+            return False, "Profit too small for protection"
+        
+        # Analyze market conditions
+        market_condition = market_data.get('condition', 'UNKNOWN')
+        current_signal = market_data.get('signal', Signal.HOLD)
+        rsi = market_data.get('rsi', 50)
+        price = market_data.get('price', 0)
+        ema = market_data.get('ema', 0)
+        
+        # Profit protection criteria
+        
+        # 1. Signal reversal detected
+        if self.type == "BUY" and current_signal == Signal.SELL:
+            if profit_percent >= 1.2:  # At least 1.2% profit
+                return True, f"Signal reversal to SELL - securing profit R{profit_amount:.2f}"
+        elif self.type == "SELL" and current_signal == Signal.BUY:
+            if profit_percent >= 1.2:
+                return True, f"Signal reversal to BUY - securing profit R{profit_amount:.2f}"
+        
+        # 2. Market condition turning against trade
+        if self.type == "BUY":
+            # Buy trade protection
+            if market_condition in ['OVERBOUGHT', 'DOWNTREND'] and profit_percent >= 1.0:
+                return True, f"Market {market_condition} - securing profit R{profit_amount:.2f}"
+            
+            # RSI overbought and price below EMA (bearish signs)
+            if rsi > 70 and price < ema and profit_percent >= 1.5:
+                return True, f"RSI overbought with bearish price - securing profit R{profit_amount:.2f}"
+                
+            # Price approaching resistance
+            if market_data.get('price_position', 0.5) > 0.85 and profit_percent >= 1.0:
+                return True, f"Price near resistance - securing profit R{profit_amount:.2f}"
+                
+        else:  # SELL trade
+            # Sell trade protection
+            if market_condition in ['OVERSOLD', 'UPTREND'] and profit_percent >= 1.0:
+                return True, f"Market {market_condition} - securing profit R{profit_amount:.2f}"
+            
+            # RSI oversold and price above EMA (bullish signs)
+            if rsi < 30 and price > ema and profit_percent >= 1.5:
+                return True, f"RSI oversold with bullish price - securing profit R{profit_amount:.2f}"
+                
+            # Price approaching support
+            if market_data.get('price_position', 0.5) < 0.15 and profit_percent >= 1.0:
+                return True, f"Price near support - securing profit R{profit_amount:.2f}"
+        
+        # 3. Profit fading detection
+        if self.max_profit > 0:
+            profit_fade_ratio = self.unrealized_pnl / self.max_profit
+            if profit_fade_ratio < 0.6 and profit_percent >= 0.8:  # Lost more than 40% of max profit
+                return True, f"Profit fading from R{self.max_profit:.2f} to R{profit_amount:.2f}"
+        
+        # 4. Time-based profit protection (for trades running too long)
+        if self.duration_minutes > 60 and profit_percent >= 0.5:  # 1 hour with profit
+            return True, f"Long profitable trade - securing R{profit_amount:.2f} after {self.duration_minutes} minutes"
+        
+        # 5. Volatility spike protection
+        if market_data.get('volatility', 0) > 2.0 and profit_percent >= 0.6:  # High volatility
+            return True, f"High volatility detected - securing profit R{profit_amount:.2f}"
+        
+        return False, "No profit protection needed"
     
     def get_trailing_stop_price(self) -> float:
         """Calculate trailing stop price based on max profit"""
@@ -203,6 +325,12 @@ class TradeMonitor:
             price = float(last['close'])
             ema = float(last['ema'])
             
+            # Get additional market data for profit protection
+            volatility = float(last.get('volatility', 0))
+            price_position = float(last.get('price_position', 0.5))
+            resistance = float(last.get('resistance', price * 1.02))
+            support = float(last.get('support', price * 0.98))
+            
             # Determine market condition
             if rsi < 35:
                 condition = 'OVERSOLD'
@@ -220,7 +348,11 @@ class TradeMonitor:
                 'signal': signal,
                 'rsi': rsi,
                 'price': price,
-                'ema': ema
+                'ema': ema,
+                'volatility': volatility,
+                'price_position': price_position,
+                'resistance': resistance,
+                'support': support
             }
             
         except Exception as e:
@@ -228,7 +360,7 @@ class TradeMonitor:
             return {'condition': 'ERROR', 'signal': Signal.HOLD, 'rsi': 50, 'price': 0, 'ema': 0}
     
     def _analyze_trade(self, trade: OpenTrade, market_data: Dict) -> TradeDecision:
-        """Analyze a trade and make a decision with enhanced loss protection"""
+        """Analyze a trade and make a decision with enhanced loss and profit protection"""
         
         # Check if trade should be closed due to stop loss or take profit
         if trade.type == "BUY":
@@ -242,8 +374,14 @@ class TradeMonitor:
             elif trade.current_price <= trade.take_profit:
                 return TradeDecision("CLOSE", "Take profit hit", confidence=1.0)
         
-        # Enhanced loss protection - check first
-        should_close, reason = trade.should_close_for_loss_protection()
+        # PROACTIVE PROFIT PROTECTION - Check first for profitable trades
+        if trade.unrealized_pnl > 0:
+            should_close, reason = trade.should_close_for_profit_protection(market_data)
+            if should_close:
+                return TradeDecision("CLOSE", reason, confidence=0.85)
+        
+        # Enhanced loss protection - check for losing trades with predictive analysis
+        should_close, reason = trade.should_close_for_loss_protection(market_data)
         if should_close:
             return TradeDecision("CLOSE", reason, confidence=0.9)
         
@@ -251,8 +389,8 @@ class TradeMonitor:
         if trade.duration_minutes < self.min_trade_duration_minutes:
             return TradeDecision("HOLD", f"Too early (only {trade.duration_minutes} minutes)", confidence=0.8)
         
-        # Check maximum duration (reduced to 30 minutes)
-        if trade.duration_minutes > 30:
+        # Check maximum duration (increased to 45 minutes to match loss protection)
+        if trade.duration_minutes > 45:
             return TradeDecision("CLOSE", f"Maximum duration exceeded ({trade.duration_minutes} minutes)", confidence=0.7)
         
         # Analyze based on market conditions

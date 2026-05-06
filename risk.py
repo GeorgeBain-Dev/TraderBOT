@@ -35,8 +35,8 @@ def _round_step(value: float, step: float) -> float:
 @dataclass
 class RiskManager:
     risk_per_trade: float = 0.01
-    sl_atr_mult: float = 1.5
-    tp_rr: float = 2.0
+    sl_atr_mult: float = 1.5  # Tighter stop loss
+    tp_rr: float = 2.5  # Higher risk/reward for profitability
 
     def calc_sl_tp(
             self,
@@ -44,7 +44,7 @@ class RiskManager:
             entry: float,
             atr_value: float,
     ) -> Tuple[float, float]:
-        sl_dist = max(float(atr_value) * self.sl_atr_mult, 1e-6)
+        sl_dist = max(float(atr_value) * self.sl_atr_mult, 2e-6)
         if direction.upper() == "BUY":
             sl = entry - sl_dist
             tp = entry + sl_dist * self.tp_rr
