@@ -8,7 +8,7 @@ from typing import Optional
 class BotConfig:
     # Core
     symbol: str = "XRPUSD"  # Default to XRPUSD for more volatility
-    timeframe: str = "M5"  # MT5 timeframe string, mapped in data.py
+    timeframe: str = "M30"  # MT5 timeframe string, mapped in data.py
     candles: int = 300
     poll_seconds: float = 2.0
 
