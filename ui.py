@@ -721,7 +721,7 @@ class BotApp(tk.Tk):
             wa.send("MT5 Bot test alert: WhatsApp notifications are working.")
             self._append_log("INFO | WhatsApp test alert sent.")
         except Exception as e:
-            self._append_log(f"ERROR | WhatsApp test test failed: {type(e).__name__}: {e}")
+            self._append_log(f"ERROR | WhatsApp test failed: {type(e).__name__}: {e}")
 
 
 def run_app() -> None:
