@@ -19,7 +19,7 @@ class BotConfig:
     # Default False so the bot behaves like a typical live EA:
     # it trades the strategy signals directly. Turn this on if you want
     # the optimizer to gate trading (LIVE/NO_EDGE).
-    auto_calibrate: bool = True  # Disable to allow immediate trading
+    auto_calibrate: bool = False  # Disable to allow immediate trading
     calibration_candles: int = 2500
     calibration_every_minutes: int = 15
     min_trades_for_edge: int = 2  # Lower minimum for more flexibility
