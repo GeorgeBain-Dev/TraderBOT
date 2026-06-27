@@ -24,13 +24,21 @@
 
 ### **📊 Trading Strategy**
 - **`strategy.py`** - Enhanced RSI + EMA trading strategy with MACD
-  - Optimized signal generation for XRPUSD volatility
-  - Expanded RSI range (25-75) for more opportunities
-  - Fixed MACD logic with proper signal line comparisons
-  - Balanced signal threshold (0.8) for quality vs frequency
-  - Single signal confirmation for faster execution
+  - **Automated Parameter Tuning System** - Dynamic threshold adjustment based on symbol volatility and market regime
+  - Symbol-specific volatility baselines for 10+ symbols (XRPUSD, BTCUSD, ETHUSD, EURUSD, GBPUSD, USDJPY, etc.)
+  - Market regime detection (TRENDING_HIGH_VOL, TRENDING_LOW_VOL, CHOPPY_HIGH_VOL, FLAT, RANGING)
+  - Dynamic signal threshold adjustment based on volatility ratio and market conditions
+  - Dynamic trade score threshold based on symbol volatility
+  - 6 additional BUY signal conditions (breakout, RSI momentum, trend continuation, bullish engulfing, volatility breakout, EMA bounce)
+  - 6 additional SELL signal conditions (breakdown, RSI momentum, downtrend continuation, bearish engulfing, volatility breakdown, EMA bounce)
+  - Relaxed entry timing filters for improved trade frequency
   - Multi-timeframe confirmation (M15/H1)
   - Market regime detection and trend analysis
+- **`trade_scorer.py`** - Trade quality scoring system
+  - Dynamic minimum score based on symbol volatility
+  - Multi-factor scoring (trend, multi-timeframe, candlestick, volume, session, spread, support/resistance)
+- **`market_analysis.py`** - Market analysis and trend detection
+- **`signal_tracker.py`** - Signal performance tracking and outcome recording
 
 ### **🛡️ Risk Management**
 - **`risk.py`** - Advanced risk management with dynamic position sizing
@@ -88,6 +96,8 @@
   - Historical data testing
   - Performance analysis
   - Win rate and profit factor calculation
+- **`strategy_tester.py`** - Strategy testing and validation
+- **`multi_timeframe.py`** - Multi-timeframe analysis tools
 
 ---
 
@@ -218,19 +228,21 @@ python main.py
 
 ### **Risk Management**
 ```python
-RISK_PER_TRADE = 0.01          # 1% risk per trade
-SL_ATR_MULTIPLIER = 1.5        # Tighter stop loss for reduced risk
-TP_RR_RATIO = 2.5              # Higher risk/reward for profitability
+RISK_PER_TRADE = 0.005         # 0.5% risk per trade (reduced for safety)
+SL_ATR_MULTIPLIER = 1.0        # Tighter stop loss for reduced risk
+TP_RR_RATIO = 2.0              # Risk/reward ratio
+MAX_LOSS_PER_TRADE = 0.002     # Hard cap: 0.2% of account
 MAX_POSITION_SIZE = 100.0      # Maximum lot size
 ```
 
 ### **Strategy Parameters**
 ```python
 RSI_PERIOD = 14                # RSI calculation period
-EMA_PERIOD = 100               # EMA calculation period (optimized for speed)
-RSI_BUY_LEVEL = 25             # Optimized for XRPUSD volatility
-RSI_SELL_LEVEL = 75            # Optimized for XRPUSD volatility
-SIGNAL_THRESHOLD = 0.8          # Balanced quality vs frequency
+EMA_PERIOD = 200               # EMA calculation period
+RSI_BUY_LEVEL = 30.0           # RSI buy level
+RSI_SELL_LEVEL = 70.0          # RSI sell level
+SIGNAL_STRENGTH_THRESHOLD = 2.5  # Signal strength threshold
+USE_MULTI_TIMEFRAME_CONFIRMATION = True  # Multi-timeframe validation
 SIGNAL_CONFIRMATION = 1         # Fast execution
 ```
 
@@ -246,12 +258,12 @@ TIME_DECAY_RATE = 0.02                # 2% recovery probability decay
 
 ### **Profit Protection**
 ```python
-MIN_PROFIT_THRESHOLD = 0.8             # 0.8% minimum for protection
-SIGNAL_REVERSAL_PROFIT = 1.2          # 1.2% for signal reversal
-MARKET_CONDITION_PROFIT = 1.0          # 1.0% for trend change
-RSI_EXTREME_PROFIT = 1.5              # 1.5% for RSI extremes
-SUPPORT_RESISTANCE_PROFIT = 1.0        # 1.0% near key levels
-PROFIT_FADING_THRESHOLD = 0.6          # 40% drop from max profit
+MIN_PROFIT_PERCENT_FOR_PROTECTION = 0.50  # 50% of risk for protection
+MIN_PROFIT_PERCENT_FALLBACK = 0.25         # 25% fallback threshold
+PROFIT_GIVEBACK_RATIO = 0.60               # 60% profit giveback
+SIGNAL_REVERSAL_RISK_THRESHOLD = 0.75      # 75% of risk for signal reversal
+LOSS_RISK_CLOSE_RATIO = 0.50               # 50% risk threshold for loss protection
+LOSS_TIMEOUT_MINUTES = 45                   # 45-minute maximum duration
 ```
 
 ---
@@ -305,6 +317,46 @@ PROFIT_FADING_THRESHOLD = 0.6          # 40% drop from max profit
 ### **Contact**
 - Email: georgebain781@gmail.com
 - GitHub: @GeorgeBain-Dev
+
+---
+
+## ⚠️ Current Issues
+
+### **1. Crypto Trade Frequency Decreased**
+**Problem**: The automated parameter tuning system is reducing crypto trade frequency
+
+**Root Causes**:
+- Volatility ratio penalty: When volatility_ratio > 2.0, signal threshold raised by 30% and trade score threshold raised by 20%
+- Market regime penalty: CHOPPY_HIGH_VOL regime raises threshold by 30%
+- Combined effect: Thresholds can be raised by up to 69% for crypto pairs
+- Base threshold (2.5) is already high before penalties
+- Multi-timeframe confirmation adds another filter layer
+
+**Impact**: Crypto pairs (XRPUSD, BTCUSD, ETHUSD) are generating significantly fewer signals because the system penalizes the exact market conditions (high volatility, choppy) that characterize crypto trading.
+
+### **2. No Trades on GOLD/XAUUSD**
+**Problem**: Zero trades executed for GOLD despite bot running in LIVE mode
+
+**Root Causes**:
+- Signal generation never produces BUY or SELL signals for XAUUSD
+- Signal thresholds and filters are too strict for GOLD's volatility characteristics
+- Similar to USDJPY - different volatility profile than parameters were tuned for
+
+**Expected Fix**: The automated parameter tuning system should help, but hasn't been tested on GOLD yet.
+
+### **3. No Trades on USDJPY**
+**Problem**: Zero trades executed for USDJPY despite bot running in LIVE mode
+
+**Root Causes**:
+- USDJPY has very low volatility (0.08 baseline) compared to crypto (0.8)
+- Signal threshold (2.5) is too aggressive for stable major currency pairs
+- Multi-timeframe confirmation adds another filter layer
+- Trade score threshold (48) filters out valid signals
+
+**Expected Fix**: The automated parameter tuning system should lower thresholds for low-volatility symbols, but needs testing.
+
+### **Summary**
+The automated parameter tuning system was designed to help low-volatility symbols (USDJPY, GOLD) by dynamically adjusting thresholds based on symbol characteristics and market regime. However, it inadvertently hurts high-volatility crypto pairs by penalizing the very conditions that are normal for crypto markets. The system needs refinement to avoid penalizing crypto pairs for their inherent volatility characteristics.
 
 ---
 
