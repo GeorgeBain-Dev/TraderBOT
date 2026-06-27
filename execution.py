@@ -107,7 +107,17 @@ class ExecutionEngine:
 
             result = mt5.order_send(request)
             if result is not None and result.retcode == mt5.TRADE_RETCODE_DONE:
-                return ExecutionResult(True, f"Order placed: {direction} {symbol} vol={volume} price={price} sl={sl} tp={tp}", order_id=result.order)
+                ticket = self.find_position_ticket(symbol)
+                sl_ok, sl_msg = self.verify_position_stops(
+                    symbol, ticket, expected_sl=sl, expected_tp=tp
+                )
+                msg = (
+                    f"Order placed: {direction} {symbol} vol={volume} price={price} "
+                    f"sl={sl} tp={tp} | {sl_msg}"
+                )
+                if not sl_ok:
+                    logger.warning(msg)
+                return ExecutionResult(True, msg, order_id=result.order)
             elif result is not None:
                 logger.warning(f"Filling mode {mode} failed with retcode={result.retcode}: {result.comment}")
                 continue
@@ -118,30 +128,81 @@ class ExecutionEngine:
         else:
             return ExecutionResult(False, f"Order failed retcode={result.retcode} comment={result.comment}")
 
-    def close_position(self, order_id: int, close_type: str) -> ExecutionResult:
-        """Close an existing position"""
-        if not self.client.initialize():
-            return ExecutionResult(False, "MT5 initialize failed")
-        
+    def verify_position_stops(
+        self,
+        symbol: str,
+        ticket: Optional[int],
+        *,
+        expected_sl: float,
+        expected_tp: float,
+    ) -> tuple[bool, str]:
+        """Confirm broker accepted SL/TP on the open position."""
+        if not ticket:
+            return False, "no position ticket to verify"
         try:
             import MetaTrader5 as mt5
-            
-            # Get position info
-            position = mt5.positions_get(ticket=order_id)
+
+            pos = mt5.positions_get(ticket=ticket)
+            if not pos:
+                return False, f"position {ticket} not found after order"
+            p = pos[0]
+            actual_sl = float(getattr(p, "sl", 0.0) or 0.0)
+            actual_tp = float(getattr(p, "tp", 0.0) or 0.0)
+            if actual_sl <= 0:
+                return (
+                    False,
+                    f"WARNING: position {ticket} has NO stop loss on broker "
+                    f"(requested sl={expected_sl:.5f})",
+                )
+            return (
+                True,
+                f"position {ticket} sl={actual_sl:.5f} tp={actual_tp:.5f}",
+            )
+        except Exception as e:
+            return False, f"stop verification failed: {e}"
+
+    def find_position_ticket(
+        self,
+        symbol: str,
+        *,
+        after_order: Optional[int] = None,
+    ) -> Optional[int]:
+        """Resolve position ticket by symbol/magic (optionally after a new order)."""
+        positions = self.positions(symbol=symbol)
+        if not positions:
+            return None
+        if after_order is not None:
+            for p in positions:
+                if int(getattr(p, "identifier", 0) or 0) == after_order:
+                    return int(getattr(p, "ticket", 0) or 0)
+        for p in positions:
+            if int(getattr(p, "magic", 0) or 0) == int(self.magic_number):
+                return int(getattr(p, "ticket", 0) or 0)
+        return int(getattr(positions[0], "ticket", 0) or 0)
+
+    def close_position(self, ticket: int, close_direction: str) -> ExecutionResult:
+        """Close an existing position. close_direction is the closing deal side (SELL closes BUY)."""
+        if not self.client.initialize():
+            return ExecutionResult(False, "MT5 initialize failed")
+
+        try:
+            import MetaTrader5 as mt5
+
+            position = mt5.positions_get(ticket=ticket)
             if not position:
-                return ExecutionResult(False, f"Position {order_id} not found")
-            
+                return ExecutionResult(False, f"Position {ticket} not found")
+
             pos = position[0]
             symbol = pos.symbol
             volume = pos.volume
-            
-            # Determine close type
-            if close_type == "BUY":
-                order_type = mt5.ORDER_TYPE_BUY
-                price = self.client.tick(symbol).ask
-            else:
+
+            close_dir = close_direction.upper()
+            if close_dir == "SELL":
                 order_type = mt5.ORDER_TYPE_SELL
-                price = self.client.tick(symbol).bid
+                price = float(self.client.tick(symbol).bid)
+            else:
+                order_type = mt5.ORDER_TYPE_BUY
+                price = float(self.client.tick(symbol).ask)
             
             # Create close request
             request = {
@@ -149,7 +210,7 @@ class ExecutionEngine:
                 "symbol": symbol,
                 "volume": volume,
                 "type": order_type,
-                "position": order_id,
+                "position": ticket,
                 "price": price,
                 "deviation": int(self.deviation_points),
                 "magic": int(self.magic_number),
@@ -165,34 +226,60 @@ class ExecutionEngine:
             if result.retcode != mt5.TRADE_RETCODE_DONE:
                 return ExecutionResult(False, f"Close order failed retcode={result.retcode}: {result.comment}")
             
-            return ExecutionResult(True, f"Position {order_id} closed successfully", order_id=result.order)
+            return ExecutionResult(True, f"Position {ticket} closed successfully", order_id=result.order)
             
         except Exception as e:
             return ExecutionResult(False, f"Error closing position: {e}")
     
-    def modify_stop_loss(self, order_id: int, new_stop_loss: float) -> ExecutionResult:
+    def normalize_stop_loss(
+        self,
+        symbol: str,
+        position_side: str,
+        reference_price: float,
+        stop_loss: float,
+    ) -> float:
+        """Clamp SL to broker minimum stop distance from reference price."""
+        try:
+            info = self.client.symbol_info(symbol)
+            point = float(getattr(info, "point", 0.0) or 0.00001)
+            stops_level = int(getattr(info, "trade_stops_level", 0) or 0)
+            min_dist = max(stops_level * point, point)
+        except Exception:
+            min_dist = 0.0001
+
+        side = position_side.upper()
+        if side == "BUY":
+            max_sl = reference_price - min_dist
+            return min(float(stop_loss), max_sl)
+        max_sl = reference_price + min_dist
+        return max(float(stop_loss), max_sl)
+
+    def modify_stop_loss(self, ticket: int, new_stop_loss: float) -> ExecutionResult:
         """Modify stop loss for an existing position"""
         if not self.client.initialize():
             return ExecutionResult(False, "MT5 initialize failed")
-        
+
         try:
             import MetaTrader5 as mt5
-            
-            # Get position info
-            position = mt5.positions_get(ticket=order_id)
+
+            position = mt5.positions_get(ticket=ticket)
             if not position:
-                return ExecutionResult(False, f"Position {order_id} not found")
-            
+                return ExecutionResult(False, f"Position {ticket} not found")
+
             pos = position[0]
             symbol = pos.symbol
-            
-            # Create modify request
+            ptype = int(getattr(pos, "type", 0))
+            side = "BUY" if ptype == 0 else "SELL"
+            tick = self.client.tick(symbol)
+            ref = float(tick.bid if side == "BUY" else tick.ask)
+            sl = self.normalize_stop_loss(symbol, side, ref, new_stop_loss)
+
             request = {
                 "action": mt5.TRADE_ACTION_SLTP,
                 "symbol": symbol,
-                "sl": new_stop_loss,
-                "tp": pos.tp,  # Keep existing take profit
-                "position": order_id,
+                "sl": sl,
+                "tp": pos.tp,
+                "position": ticket,
                 "magic": int(self.magic_number),
                 "comment": "Modify stop loss",
             }
@@ -204,7 +291,11 @@ class ExecutionEngine:
             if result.retcode != mt5.TRADE_RETCODE_DONE:
                 return ExecutionResult(False, f"Modify SL failed retcode={result.retcode}: {result.comment}")
             
-            return ExecutionResult(True, f"Stop loss modified to {new_stop_loss} for position {order_id}", order_id=result.order)
+            return ExecutionResult(
+                True,
+                f"Stop loss modified to {sl} for position {ticket}",
+                order_id=result.order,
+            )
             
         except Exception as e:
             return ExecutionResult(False, f"Error modifying stop loss: {e}")

@@ -21,8 +21,17 @@ def setup_logging(log_dir: str = "logs", level: int = logging.INFO, run_id: Opti
     logger = logging.getLogger("bot")
     logger.setLevel(level)
 
-    if logger.handlers:
+    if logger.handlers and run_id is None:
         return logger
+
+    # Reconfigure the logger if a specific run_id is provided.
+    if logger.handlers and run_id is not None:
+        for handler in list(logger.handlers):
+            logger.removeHandler(handler)
+            try:
+                handler.close()
+            except Exception:
+                pass
 
     # Generate unique run ID if not provided
     if run_id is None:
@@ -58,7 +67,8 @@ def setup_logging(log_dir: str = "logs", level: int = logging.INFO, run_id: Opti
     logger.addHandler(fh)
 
     logger.propagate = False
-    logger.info(f"Started new run with log file: bot_{run_id}.log")
+    rel_logfile = os.path.relpath(logfile)
+    logger.info(f"Started new run with log file: {rel_logfile}")
     return logger
 
 

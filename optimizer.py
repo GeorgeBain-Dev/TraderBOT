@@ -85,10 +85,11 @@ def calibrate_best_params(
 
     for rp in rsi_periods:
         for ep in ema_periods:
-            strat = RsiEmaStrategy()
-            strat.update_timeframe("M5")  # Use default timeframe for calibration
             for slm in sl_mults:
                 for rr in rr_values:
+                    strat = RsiEmaStrategy()
+                    strat.rsi_period = rp
+                    strat.ema_period = ep
                     risk = RiskManager(risk_per_trade=0.01, sl_atr_mult=slm, tp_rr=rr)
                     res = run_backtest(df, strat, risk, initial_balance=initial_balance)
                     trades_n = len(res.trades)

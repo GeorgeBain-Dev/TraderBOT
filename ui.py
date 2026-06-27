@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import queue
 import threading
+import time
 import tkinter as tk
 from tkinter import ttk
 from typing import Optional
@@ -22,7 +23,7 @@ except ImportError:
     NavigationToolbar2Tk = None
 
 try:
-    from .config import BotConfig
+    from .config import BotConfig, SUPPORTED_TIMEFRAMES, config_field_specs, config_from_dict
     from .data import get_latest_candles, MT5Client, MT5Error
     from .execution import ExecutionEngine, ExecutionResult
     from .main import TradingBot
@@ -36,7 +37,7 @@ except ImportError:
     import os
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     
-    from config import BotConfig
+    from config import BotConfig, SUPPORTED_TIMEFRAMES, config_field_specs, config_from_dict
     from data import get_latest_candles, MT5Client, MT5Error
     from execution import ExecutionEngine, ExecutionResult
     from main import TradingBot
@@ -58,14 +59,16 @@ class BotApp(tk.Tk):
 
         self.event_q: "queue.Queue[BotEvent]" = queue.Queue()
         self.bot: Optional[TradingBot] = None
+        self.app_config = BotConfig()
         self.client = MT5Client()
         self.is_logged_in = False
         self.execution_engine = ExecutionEngine(self.client)
-        self.trade_monitor = TradeMonitor(self.client, self.execution_engine)
+        self.trade_monitor: Optional[TradeMonitor] = None
         self.continuous_calibrator: Optional[ContinuousCalibrator] = None
+        self._config_field_vars: dict = {}
 
-        self.symbol_var = tk.StringVar(value="XRPUSD")
-        self.timeframe_var = tk.StringVar(value="M5")
+        self.symbol_var = tk.StringVar(value=self.app_config.symbol)
+        self.timeframe_var = tk.StringVar(value=self.app_config.timeframe)
         self.mt5_path_var = tk.StringVar(value="")
         self.mt5_login_var = tk.StringVar(value="")
         self.mt5_pass_var = tk.StringVar(value="")
@@ -82,8 +85,8 @@ class BotApp(tk.Tk):
         self.funds_var = tk.StringVar(value="—")
         self.trades_var = tk.StringVar(value="0")
         self.trades_detail_var = tk.StringVar(value="")
-        self.test_mode_var = tk.BooleanVar(value=False)
-        self.auto_calibrate_var = tk.BooleanVar(value=False)
+        self.test_mode_var = tk.BooleanVar(value=self.app_config.test_mode)
+        self.auto_calibrate_var = tk.BooleanVar(value=self.app_config.auto_calibrate)
         self._logo_img = None
         self.symbol_combo = None  # Reference to symbol combobox
 
@@ -113,12 +116,11 @@ class BotApp(tk.Tk):
                     
                     # Update the combobox values
                     if self.symbol_combo:
-                        self.symbol_combo['values'] = symbol_names[:30]  # Limit to first 30 for performance
-                        logger.info(f"Loaded {len(symbol_names)} symbols from market watch")
-                        
-                        # Set first symbol as default if current is not in list
-                        if self.symbol_var.get() not in symbol_names:
-                            self.symbol_var.set(symbol_names[0] if symbol_names else "XRPUSD")
+                        limit = self.app_config.max_symbols_in_dropdown
+                        self.symbol_combo["values"] = symbol_names[:limit]
+                        logger.info("Loaded %s symbols from market watch", len(symbol_names))
+                        if self.symbol_var.get().strip() not in symbol_names and symbol_names:
+                            self.symbol_var.set(symbol_names[0])
                 else:
                     logger.warning("No symbols found in market watch")
                     # Fallback to default symbols
@@ -133,54 +135,49 @@ class BotApp(tk.Tk):
             self._set_default_symbols()
     
     def _set_default_symbols(self) -> None:
-        """Set default symbol list when market watch is unavailable"""
-        default_symbols = ["XRPUSD", "EURUSD", "GBPUSD", "USDJPY", "XAUUSD", "US30", "BTCUSD", "ETHUSD"]
-        try:
-            if self.symbol_combo:
-                self.symbol_combo['values'] = default_symbols
-                logger.info("Using default symbol list")
-        except Exception as e:
-            logger.error(f"Failed to set default symbols: {e}")
+        """No hardcoded symbols — user must connect MT5 or type symbol manually."""
+        if self.symbol_combo:
+            self.symbol_combo["values"] = ()
+        logger.info("Symbol list empty until MT5 market watch is loaded")
     
     def _monitor_trades(self) -> None:
-        """Monitor open trades and make management decisions"""
+        """Monitor open trades and make management decisions (always scheduled)."""
+        interval_ms = 2000
         try:
-            if self.trade_monitor.open_trades:
-                # Update all trades with current data
+            if self.trade_monitor is not None:
+                interval_ms = max(500, int(self.trade_monitor.cfg.monitor_poll_seconds * 1000))
                 decisions = self.trade_monitor.update_all_trades()
-                
-                # Execute decisions
-                for order_id, decision in decisions:
-                    if decision.action in ["CLOSE", "MODIFY_SL"]:
-                        success = self.trade_monitor.execute_decision(order_id, decision)
-                        if success:
-                            logger.info(f"Executed {decision.action} for trade {order_id}: {decision.reason}")
+                for ticket, decision in decisions:
+                    if decision.action in ("CLOSE", "MODIFY_SL"):
+                        ok = self.trade_monitor.execute_decision(ticket, decision)
+                        if ok:
+                            self._append_log(
+                                f"INFO | {decision.action} ticket={ticket}: {decision.reason}"
+                            )
                         else:
-                            logger.error(f"Failed to execute {decision.action} for trade {order_id}")
-                
-                # Update UI with trade summary
+                            self._append_log(
+                                f"ERROR | {decision.action} ticket={ticket} failed"
+                            )
+
                 summary = self.trade_monitor.get_trade_summary()
-                self.trades_var.set(str(summary['total_trades']))
-                
-                # Update trades detail
-                if summary['trades']:
-                    details = []
-                    for trade in summary['trades']:
-                        details.append(f"{trade['type']} {trade['symbol']} R{trade['unrealized_pnl']:.2f}")
-                    self.trades_detail_var.set(" | ".join(details[:3]))  # Show first 3
+                self.trades_var.set(str(summary["total_trades"]))
+                if summary["trades"]:
+                    parts = [
+                        f"{t['type']} {t['symbol']} {t['unrealized_pnl']:.2f} (peak {t['max_profit']:.2f}) "
+                        f"SL≈{t['stop_loss_value']:.2f} TP≈{t['take_profit_value']:.2f}"
+                        for t in summary["trades"][:3]
+                    ]
+                    self.trades_detail_var.set(" | ".join(parts))
                 else:
                     self.trades_detail_var.set("")
-                
-                # Update live graph every 2 seconds
-                self._refresh_graph()
-            
-            # Schedule next monitoring cycle (every 2 seconds for live updates)
-            self.after(2000, self._monitor_trades)
-            
+
+                if self.is_logged_in:
+                    self._refresh_graph()
         except Exception as e:
-            logger.error(f"Error in trade monitoring: {e}")
-            # Continue monitoring even if there's an error
-            self.after(10000, self._monitor_trades)
+            logger.error("Trade monitoring error: %s", e)
+            interval_ms = 5000
+
+        self.after(interval_ms, self._monitor_trades)
 
     def _init_style(self) -> None:
         style = ttk.Style(self)
@@ -261,31 +258,32 @@ class BotApp(tk.Tk):
         ctrls.grid(row=0, column=1, sticky="w")
 
         ttk.Label(ctrls, text="Symbol", style="SubTitle.TLabel").grid(row=0, column=0, padx=(0, 6))
-        ttk.Combobox(
+        self.symbol_combo = ttk.Combobox(
             ctrls,
             textvariable=self.symbol_var,
-            values=["XRPUSD", "EURUSD", "GBPUSD", "USDJPY", "XAUUSD", "US30"],
-            width=10,
+            values=[],
+            width=12,
             state="normal",
-        ).grid(row=0, column=1, padx=(0, 14))
-        self.symbol_combo = ctrls.winfo_children()[-1]  # Store reference
+        )
+        self.symbol_combo.grid(row=0, column=1, padx=(0, 14))
 
         ttk.Label(ctrls, text="Timeframe", style="SubTitle.TLabel").grid(row=0, column=2, padx=(0, 6))
         ttk.Combobox(
             ctrls,
             textvariable=self.timeframe_var,
-            values=["M1", "M5", "M15", "M30", "H1", "H4", "D1"],
+            values=list(SUPPORTED_TIMEFRAMES),
             width=6,
             state="readonly",
         ).grid(row=0, column=3, padx=(0, 14))
 
-        ttk.Button(ctrls, text="⚙️ Settings", command=self._open_menu).grid(row=0, column=4, padx=(0, 10))
-        ttk.Label(ctrls, textvariable=self.connected_var, style="SubTitle.TLabel").grid(row=0, column=5, padx=(0, 10))
+        ttk.Button(ctrls, text="Connect", command=self._connect).grid(row=0, column=4, padx=(0, 8))
+        ttk.Button(ctrls, text="⚙️", width=3, command=self._open_menu).grid(row=0, column=5, padx=(0, 10))
+        ttk.Label(ctrls, textvariable=self.connected_var, style="SubTitle.TLabel").grid(row=0, column=6, padx=(0, 10))
 
-        self.start_btn = ttk.Button(ctrls, text="▶️ Start", command=self._start, state="disabled", style="Start.TButton")
-        self.start_btn.grid(row=0, column=6, padx=(0, 8))
-        self.stop_btn = ttk.Button(ctrls, text="⏹️ Stop", command=self._stop, state="disabled", style="Stop.TButton")
-        self.stop_btn.grid(row=0, column=7, padx=(0, 0))
+        self.start_btn = ttk.Button(ctrls, text="▶ Start", command=self._start, state="disabled", style="Start.TButton")
+        self.start_btn.grid(row=0, column=7, padx=(0, 8))
+        self.stop_btn = ttk.Button(ctrls, text="■ Stop", command=self._stop, state="disabled", style="Stop.TButton")
+        self.stop_btn.grid(row=0, column=8, padx=(0, 0))
 
         # Error line
         ttk.Label(top, textvariable=self.err_var, style="SubTitle.TLabel").grid(
@@ -546,6 +544,7 @@ class BotApp(tk.Tk):
             activebackground="#1b1b26",
             activeforeground=self._fg,
         )
+        m.add_command(label="Bot configuration…", command=self._open_config_dialog)
         m.add_command(label="Connection settings…", command=self._open_connection_dialog)
         m.add_command(label="WhatsApp settings…", command=self._open_whatsapp_dialog)
         m.add_separator()
@@ -602,35 +601,75 @@ class BotApp(tk.Tk):
         ttk.Button(btns, text="Send test", command=self._test_whatsapp).grid(row=0, column=0, padx=(0, 8))
         ttk.Button(btns, text="Close", command=win.destroy).grid(row=0, column=1)
 
+    def _build_config(self) -> BotConfig:
+        data = {name: var.get() for name, var in self._config_field_vars.items()}
+        data["symbol"] = self.symbol_var.get().strip()
+        data["timeframe"] = self.timeframe_var.get().strip()
+        data["test_mode"] = self.test_mode_var.get()
+        data["auto_calibrate"] = self.auto_calibrate_var.get()
+        return config_from_dict(data, self.app_config)
+
     def _start(self) -> None:
-        # Only allow start if connected
         if not self.client.initialize():
             self.connected_var.set("Disconnected")
             self._append_log("ERROR | Not connected to MT5. Click Connect first.")
             return
-        
-        # Create bot instance if not exists
+
+        try:
+            cfg = self._build_config()
+            from .config import validate_config
+        except ImportError:
+            from config import validate_config
+
+        try:
+            validate_config(cfg)
+        except ValueError as e:
+            self._append_log(f"ERROR | Config: {e}")
+            return
+
+        self.app_config = cfg
+        self.execution_engine.magic_number = cfg.magic_number
+        self.execution_engine.comment = cfg.comment
+        self.execution_engine.allow_live_trading = cfg.allow_live_trading
+        self.execution_engine.deviation_points = cfg.deviation_points
+
+        def _on_closed() -> None:
+            if self.bot:
+                self.bot._reentry_blocked_until = time.time() + float(
+                    cfg.reentry_cooldown_seconds
+                )
+
+        self.trade_monitor = TradeMonitor(
+            self.client,
+            self.execution_engine,
+            cfg,
+            on_position_closed=_on_closed,
+        )
+
         if self.bot is None:
-            cfg = BotConfig(
-                symbol=self.symbol_var.get().strip(),
-                timeframe=self.timeframe_var.get(),
-                test_mode=self.test_mode_var.get(),
-                auto_calibrate=True,  # Always use continuous calibration
-            )
-            self.bot = TradingBot(cfg, self.event_q)
-            
-            # Initialize continuous calibrator
-            self.continuous_calibrator = ContinuousCalibrator(self.client, cfg)
+            self.bot = TradingBot(cfg, self.event_q, client=self.client)
             self.bot._trade_monitor = self.trade_monitor
-            self.bot._continuous_calibrator = self.continuous_calibrator
-        
-        # Start the bot
+            if cfg.continuous_calibrate:
+                self.continuous_calibrator = ContinuousCalibrator(self.client, cfg)
+                self.bot._continuous_calibrator = self.continuous_calibrator
+        else:
+            self.bot.cfg = cfg
+            self.bot._trade_monitor = self.trade_monitor
+            if cfg.continuous_calibrate and not self.continuous_calibrator:
+                self.continuous_calibrator = ContinuousCalibrator(self.client, cfg)
+                self.bot._continuous_calibrator = self.continuous_calibrator
+            elif not cfg.continuous_calibrate and self.continuous_calibrator:
+                self.continuous_calibrator.stop_continuous_calibration()
+                self.continuous_calibrator = None
+                self.bot._continuous_calibrator = None
+            if self.continuous_calibrator:
+                self.continuous_calibrator.update_config(cfg)
+
         self.bot.start()
-        
-        # Start continuous calibration
-        if self.continuous_calibrator:
+
+        if cfg.continuous_calibrate and self.continuous_calibrator:
             self.continuous_calibrator.start_continuous_calibration()
-            self._append_log("INFO | Continuous edge calibration started.")
+            self._append_log("INFO | Continuous calibration started.")
         
         self.start_btn.configure(state="disabled")
         self.stop_btn.configure(state="normal")
@@ -711,6 +750,60 @@ class BotApp(tk.Tk):
             self._append_log("INFO | Bot stopped.")
         except Exception as e:
             self._append_log(f"ERROR | Failed to stop bot: {e}")
+
+    def _open_config_dialog(self) -> None:
+        win = tk.Toplevel(self)
+        win.title("Bot configuration")
+        win.configure(bg=self._bg)
+        win.geometry("520x560")
+        win.minsize(400, 300)
+
+        canvas = tk.Canvas(win, bg=self._bg, highlightthickness=0)
+        scroll = ttk.Scrollbar(win, orient="vertical", command=canvas.yview)
+        inner = ttk.Frame(canvas, padding=12)
+        inner.bind(
+            "<Configure>",
+            lambda e: canvas.configure(scrollregion=canvas.bbox("all")),
+        )
+        canvas.create_window((0, 0), window=inner, anchor="nw")
+        canvas.configure(yscrollcommand=scroll.set)
+        canvas.pack(side="left", fill="both", expand=True)
+        scroll.pack(side="right", fill="y")
+
+        self._config_field_vars.clear()
+        row = 0
+        for field_name, label, ftype in config_field_specs():
+            if field_name in ("symbol", "timeframe", "test_mode", "auto_calibrate"):
+                continue
+            ttk.Label(inner, text=label).grid(row=row, column=0, sticky="w", pady=2)
+            val = getattr(self.app_config, field_name)
+            if ftype is bool:
+                var: tk.Variable = tk.BooleanVar(value=bool(val))
+                ttk.Checkbutton(inner, variable=var).grid(row=row, column=1, sticky="w")
+            else:
+                var = tk.StringVar(value=str(val))
+                ttk.Entry(inner, textvariable=var, width=28).grid(row=row, column=1, sticky="ew")
+            self._config_field_vars[field_name] = var
+            row += 1
+
+        inner.columnconfigure(1, weight=1)
+
+        def _save() -> None:
+            try:
+                self.app_config = self._build_config()
+                if self.trade_monitor:
+                    self.trade_monitor.update_config(self.app_config)
+                if self.bot:
+                    self.bot.cfg = self.app_config
+                self._append_log("INFO | Configuration saved.")
+                win.destroy()
+            except Exception as e:
+                self._append_log(f"ERROR | Config save failed: {e}")
+
+        btns = ttk.Frame(inner)
+        btns.grid(row=row, column=0, columnspan=2, sticky="e", pady=(12, 0))
+        ttk.Button(btns, text="Save", command=_save).grid(row=0, column=0, padx=(0, 8))
+        ttk.Button(btns, text="Cancel", command=win.destroy).grid(row=0, column=1)
 
     def _test_whatsapp(self) -> None:
         if not bool(self.whatsapp_enabled_var.get()):

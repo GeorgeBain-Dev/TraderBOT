@@ -13,9 +13,10 @@ try:
     from .data import MT5Client, MT5Error, get_latest_candles, get_live_price
     from .execution import ExecutionEngine
     from .optimizer import EdgeCriteria, calibrate_best_params
-    from .risk import RiskManager
+    from .risk import RiskManager, money_at_risk
     from .strategy import RsiEmaStrategy, Signal
     from .notifier import ChangeDetector, WhatsAppConfig, WhatsAppNotifier, NotificationError
+    from .signal_tracker import SignalTracker
     from .utils import BotEvent, setup_logging, utc_now
 except ImportError:
     # Fallback for direct execution
@@ -27,9 +28,10 @@ except ImportError:
     from data import MT5Client, MT5Error, get_latest_candles, get_live_price
     from execution import ExecutionEngine
     from optimizer import EdgeCriteria, calibrate_best_params
-    from risk import RiskManager
+    from risk import RiskManager, money_at_risk
     from strategy import RsiEmaStrategy, Signal
     from notifier import ChangeDetector, WhatsAppConfig, WhatsAppNotifier, NotificationError
+    from signal_tracker import SignalTracker
     from utils import BotEvent, setup_logging, utc_now
 
 logger = setup_logging()
@@ -69,12 +71,18 @@ class TradingBot:
         self.status = BotStatus()
 
         self.client = client or MT5Client()
+        self._signal_tracker = SignalTracker()
+        self._last_position_profit = 0.0
+        
         self.strategy = RsiEmaStrategy(
             use_ml_confirmation=cfg.use_ml_confirmation,
             ml_min_train_rows=cfg.ml_min_train_rows,
+            signal_strength_threshold=cfg.signal_strength_threshold,
         )
-        # Initialize with timeframe-specific parameters
+        self.strategy.set_symbol(cfg.symbol)  # Set symbol for automated parameter tuning
+        self.strategy.apply_config(cfg)
         self.strategy.update_timeframe(cfg.timeframe)
+        self.strategy.set_signal_tracker(self._signal_tracker)
         self.risk = RiskManager(
             risk_per_trade=cfg.risk_per_trade,
             sl_atr_mult=cfg.sl_atr_mult,
@@ -91,6 +99,8 @@ class TradingBot:
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._next_calibration_ts = 0.0
+        self._reentry_blocked_until = 0.0
+        self._prev_positions_count = 0
         self._account_logged = False
         self._wa = wa_notifier
         self._changes = ChangeDetector()
@@ -137,7 +147,7 @@ class TradingBot:
             symbol=self.cfg.symbol,
             mode=self.status.mode,
             signal=self.status.last_signal,
-            price=float(self.status.last_price or 0.0),
+            price=float(self.status.mid or 0.0),
             positions_count=int(self.status.positions_count or 0),
         )
         if not msg:
@@ -184,9 +194,34 @@ class TradingBot:
                     logger.debug("Account info fetch failed: %s", e)
 
                 try:
-                    pos = self.exec.positions()
-                    self.status.positions_count = len(pos)
+                    pos = self.exec.positions(self.cfg.symbol)
+                    pos_count = len(pos)
+                    if self._prev_positions_count > 0 and pos_count == 0:
+                        # Position closed - record outcome for signal tracking
+                        if hasattr(self, '_last_position_profit'):
+                            self.strategy.record_trade_outcome(self._last_position_profit)
+                            self._emit("INFO", f"Recorded trade outcome: profit={self._last_position_profit:.2f}")
+                        self._reentry_blocked_until = time.time() + float(
+                            self.cfg.reentry_cooldown_seconds
+                        )
+                        self._emit(
+                            "INFO",
+                            f"Re-entry cooldown {self.cfg.reentry_cooldown_seconds}s after position closed",
+                        )
+                    self._prev_positions_count = pos_count
+                    self.status.positions_count = pos_count
                     self.status.positions_summary = self._format_positions(pos)
+                    
+                    # Track current position profit for outcome recording
+                    if pos_count > 0:
+                        current_profit = sum(float(getattr(p, "profit", 0.0) or 0.0) for p in pos)
+                        self._last_position_profit = current_profit
+                    else:
+                        self._last_position_profit = 0.0
+                    
+                    if hasattr(self, "_trade_monitor") and self._trade_monitor:
+                        self._trade_monitor.update_config(self.cfg)
+                        self._trade_monitor.sync_positions_from_mt5(self.cfg.symbol)
                 except Exception as e:
                     logger.debug("Positions fetch failed: %s", e)
 
@@ -211,7 +246,7 @@ class TradingBot:
                         min_profit_factor=self.cfg.min_profit_factor,
                         min_total_pnl=self.cfg.min_total_pnl,
                         max_drawdown_abs=self.cfg.max_drawdown_abs,
-                        min_win_rate=0.70,  # Target 70%+ win rate for more activity
+                        min_win_rate=self.cfg.min_win_rate,
                     )
                     best = calibrate_best_params(hist, criteria=crit)
                     self.status.last_calibration_utc = utc_now().isoformat()
@@ -221,19 +256,7 @@ class TradingBot:
                         self.status.mode = "LIVE"  # Still trade with default parameters
                         self._emit("WARN", "No edge found - using default parameters for live trading")
                     else:
-                        # Apply calibrated parameters
-                        self.strategy = RsiEmaStrategy(
-                            use_ml_confirmation=self.cfg.use_ml_confirmation,
-                            ml_min_train_rows=self.cfg.ml_min_train_rows,
-                        )
-                        # Update with timeframe-specific parameters
-                        self.strategy.update_timeframe(self.cfg.timeframe)
-                        self._emit("INFO", f"Applied calibrated parameters for {self.cfg.timeframe}")
-                        self.risk = RiskManager(
-                            risk_per_trade=self.cfg.risk_per_trade,
-                            sl_atr_mult=best.sl_atr_mult,
-                            tp_rr=best.tp_rr,
-                        )
+                        self._apply_calibrated(best)
                         self.status.mode = "LIVE"
                         self._emit(
                             "INFO",
@@ -259,29 +282,17 @@ class TradingBot:
                         min_profit_factor=self.cfg.min_profit_factor,
                         min_total_pnl=self.cfg.min_total_pnl,
                         max_drawdown_abs=self.cfg.max_drawdown_abs,
-                        min_win_rate=0.70,  # Target 70%+ win rate for more activity
+                        min_win_rate=self.cfg.min_win_rate,
                     )
                     best = calibrate_best_params(hist, criteria=crit)
                     self.status.last_calibration_utc = utc_now().isoformat()
                     self._next_calibration_ts = time.time() + float(self.cfg.calibration_every_minutes) * 60.0
 
                     if best is None:
-                        self.status.mode = "NO_EDGE"
-                        self._emit("WARN", "NO_EDGE: no profitable configuration found; will keep watching.")
+                        self.status.mode = "LIVE"  # Keep trading with current/default parameters
+                        self._emit("WARN", "No edge found - continuing with current parameters")
                     else:
-                        # Apply calibrated parameters
-                        self.strategy = RsiEmaStrategy(
-                            use_ml_confirmation=self.cfg.use_ml_confirmation,
-                            ml_min_train_rows=self.cfg.ml_min_train_rows,
-                        )
-                        # Update with timeframe-specific parameters
-                        self.strategy.update_timeframe(self.cfg.timeframe)
-                        self._emit("INFO", f"Applied calibrated parameters for {self.cfg.timeframe}")
-                        self.risk = RiskManager(
-                            risk_per_trade=self.cfg.risk_per_trade,
-                            sl_atr_mult=best.sl_atr_mult,
-                            tp_rr=best.tp_rr,
-                        )
+                        self._apply_calibrated(best)
                         self.status.mode = "LIVE"
                         self._emit(
                             "INFO",
@@ -305,11 +316,27 @@ class TradingBot:
                     risk = self.risk
 
                 df_prep = strategy.prepare(df)
-                sig = strategy.generate_signal(df_prep)
+                
+                # Fetch higher timeframe data for multi-timeframe confirmation
+                higher_tf_df = None
+                if strategy.use_multi_timeframe_confirmation:
+                    higher_timeframes = strategy._timeframe_hierarchy.get(self.cfg.timeframe, [])
+                    if higher_timeframes:
+                        try:
+                            higher_tf = higher_timeframes[0]  # Use first higher timeframe
+                            higher_tf_df = get_latest_candles(
+                                self.client, self.cfg.symbol, higher_tf, n=self.cfg.candles
+                            )
+                            if not higher_tf_df.empty:
+                                logger.debug(f"Multi-timeframe confirmation using {higher_tf}")
+                        except Exception as e:
+                            logger.debug(f"Failed to fetch higher timeframe data: {e}")
+                
+                sig = strategy.generate_signal(df_prep, higher_tf_df=higher_tf_df)
                 self.status.last_signal = sig.value
                 self._notify_changes()
 
-                can_trade = True  # Always trade when signals are generated
+                can_trade = time.time() >= self._reentry_blocked_until
                 if (
                     can_trade
                     and sig in (Signal.BUY, Signal.SELL)
@@ -319,52 +346,138 @@ class TradingBot:
                     atr_v = float(df_prep.iloc[-1].get("atr", 0.0))
                     direction = sig.value
                     entry = ask if direction == "BUY" else bid
-                    
+                    # Apply currently active strategy ATR multiplier to give SL room per timeframe
+                    try:
+                        atr_mult = float(getattr(strategy, "atr_multiplier", 1.0) or 1.0)
+                    except Exception:
+                        atr_mult = 1.0
+                    atr_for_sizing = float(atr_v) * atr_mult
+
+                    # Volatility guard: skip entries when market volatility is excessive
+                    vol = float(df_prep.iloc[-1].get("volatility", 0.0) or 0.0)
+                    max_vol = float(getattr(self.cfg, "max_entry_volatility_percent", 0.0) or 0.0)
+                    if max_vol > 0 and vol > max_vol:
+                        self._emit(
+                            "INFO",
+                            f"Skipping entry due to high volatility {vol:.2f}% > {max_vol:.2f}%",
+                        )
+                        continue
                     # Dynamic position sizing for small and big trades
+                    signal_confidence = self.strategy.get_signal_confidence()
                     plan = risk.plan_trade(
                         direction=direction,
                         entry=float(entry),
-                        atr_value=float(atr_v),
+                        atr_value=float(atr_for_sizing),
                         balance=float(balance),
                         client=self.client,
                         symbol=self.cfg.symbol,
+                        confidence=signal_confidence,  # Risk-based position sizing
                     )
                     
                     if plan.volume <= 0:
                         self._emit("WARN", "Signal but volume computed as 0; skipping order.")
                     else:
-                        # Calculate potential profit to determine if it's a big trade
-                        potential_profit = abs(plan.tp - plan.entry) * plan.volume
-                        is_big_trade = potential_profit > (balance * 0.02)  # More than 2% of balance = big trade
-                        
-                        res = self.exec.place_market_order(
-                            symbol=self.cfg.symbol,
-                            direction=plan.direction,
-                            volume=plan.volume,
-                            sl=plan.sl,
-                            tp=plan.tp,
+                        risk_budget = balance * self.cfg.risk_per_trade
+                        loss_if_sl = money_at_risk(
+                            self.client,
+                            self.cfg.symbol,
+                            float(entry),
+                            plan.sl,
+                            plan.volume,
+                            plan.direction,
                         )
+                        self._emit(
+                            "INFO",
+                            f"Trade plan: balance={balance:.2f} risk_budget={risk_budget:.2f} "
+                            f"({self.cfg.risk_per_trade:.2%}) vol={plan.volume} "
+                            f"entry={entry:.5f} sl={plan.sl:.5f} tp={plan.tp:.5f} "
+                            f"loss_if_sl≈{loss_if_sl:.2f}",
+                        )
+
+                        # Paper trading: log signal without executing
+                        if self.cfg.test_mode:
+                            self._emit(
+                                "INFO",
+                                f"[PAPER TRADE] {plan.direction} {self.cfg.symbol} vol={plan.volume} "
+                                f"entry={entry:.5f} sl={plan.sl:.5f} tp={plan.tp:.5f} "
+                                f"risk_budget={risk_budget:.2f} loss_if_sl≈{loss_if_sl:.2f}",
+                            )
+                            # Track paper trade for later analysis
+                            if not hasattr(self, '_paper_trades'):
+                                self._paper_trades = []
+                            self._paper_trades.append({
+                                'time': utc_now(),
+                                'symbol': self.cfg.symbol,
+                                'direction': plan.direction,
+                                'volume': plan.volume,
+                                'entry': float(entry),
+                                'sl': plan.sl,
+                                'tp': plan.tp,
+                                'risk_budget': risk_budget,
+                                'loss_if_sl': loss_if_sl,
+                            })
+                        else:
+                            res = self.exec.place_market_order(
+                                symbol=self.cfg.symbol,
+                                direction=plan.direction,
+                                volume=plan.volume,
+                                sl=plan.sl,
+                                tp=plan.tp,
+                            )
                         
-                        # Add trade to monitor if successful
-                        if res.ok and res.order_id:
+                        if res.ok and hasattr(self, "_trade_monitor") and self._trade_monitor:
                             try:
-                                # Get the trade monitor from the UI if available
-                                if hasattr(self, '_trade_monitor') and self._trade_monitor:
+                                ticket = self.exec.find_position_ticket(
+                                    self.cfg.symbol, after_order=res.order_id
+                                )
+                                if ticket:
+                                    actual_entry_price = float(entry)
+                                    positions = self.exec.positions(symbol=self.cfg.symbol)
+                                    position = next(
+                                        (
+                                            p
+                                            for p in positions
+                                            if int(getattr(p, "ticket", 0) or 0) == ticket
+                                        ),
+                                        None,
+                                    )
+                                    if position is not None:
+                                        actual_entry_price = float(getattr(position, "price_open", entry) or entry)
+                                        if abs(actual_entry_price - float(entry)) > 1e-9:
+                                            logger.info(
+                                                "Order filled at actual price %.5f (planned %.5f)",
+                                                actual_entry_price,
+                                                float(entry),
+                                            )
+                                    risk_money = money_at_risk(
+                                        self.client,
+                                        self.cfg.symbol,
+                                        actual_entry_price,
+                                        plan.sl,
+                                        plan.volume,
+                                        plan.direction,
+                                    )
                                     self._trade_monitor.add_trade(
-                                        order_id=res.order_id,
+                                        ticket=ticket,
                                         symbol=self.cfg.symbol,
-                                        type=plan.direction,
+                                        trade_type=plan.direction,
                                         volume=plan.volume,
-                                        entry_price=float(entry),
+                                        entry_price=actual_entry_price,
                                         stop_loss=plan.sl,
-                                        take_profit=plan.tp
+                                        take_profit=plan.tp,
+                                        initial_risk_money=risk_money,
                                     )
                             except Exception as e:
-                                logger.error(f"Failed to add trade to monitor: {e}")
+                                logger.error("Failed to add trade to monitor: %s", e)
                         
-                        trade_type = "BIG TRADE" if is_big_trade else "SMALL PROFIT TRADE"
-                        self._emit("INFO" if res.ok else "ERROR", f"{trade_type}: {res.message}")
+                        self._emit("INFO" if res.ok else "ERROR", res.message)
                         self._notify_changes()
+                elif sig in (Signal.BUY, Signal.SELL) and not can_trade:
+                    wait = int(self._reentry_blocked_until - time.time())
+                    self._emit(
+                        "INFO",
+                        f"Signal {sig.value} — re-entry cooldown ({wait}s remaining)",
+                    )
                 else:
                     spread = (self.status.ask - self.status.bid) if (self.status.ask and self.status.bid) else 0.0
                     self._emit(
@@ -386,7 +499,89 @@ class TradingBot:
             self.client.shutdown()
         except Exception:
             pass
+        
+        # Generate paper trading report if in test mode
+        if self.cfg.test_mode and hasattr(self, '_paper_trades') and self._paper_trades:
+            self._generate_paper_trading_report()
+        
         self._emit("INFO", "Bot stopped.")
+
+    def _apply_calibrated(self, best: object) -> None:
+        # Apply timeframe-specific settings first, then preserve the calibrated RSI/EMA values.
+        self.strategy.update_timeframe(self.cfg.timeframe)
+        self.strategy.rsi_period = best.rsi_period
+        self.strategy.ema_period = best.ema_period
+        self.risk = RiskManager(
+            risk_per_trade=self.cfg.risk_per_trade,
+            sl_atr_mult=best.sl_atr_mult,
+            tp_rr=best.tp_rr,
+        )
+        logger.info(
+            "Applied calibrated strategy: timeframe=%s rsi_period=%s ema_period=%s sl_atr_mult=%s tp_rr=%s",
+            self.cfg.timeframe,
+            best.rsi_period,
+            best.ema_period,
+            best.sl_atr_mult,
+            best.tp_rr,
+        )
+
+    def _generate_paper_trading_report(self) -> None:
+        """Generate a report of paper trading signals."""
+        if not self._paper_trades:
+            return
+        
+        report_lines = [
+            "\n" + "=" * 80,
+            "PAPER TRADING REPORT",
+            "=" * 80,
+            f"Symbol: {self.cfg.symbol}",
+            f"Timeframe: {self.cfg.timeframe}",
+            f"Total Signals: {len(self._paper_trades)}",
+            f"Report Generated: {utc_now().strftime('%Y-%m-%d %H:%M:%S UTC')}",
+            "-" * 80,
+        ]
+        
+        # Calculate statistics
+        buy_signals = sum(1 for t in self._paper_trades if t['direction'] == 'BUY')
+        sell_signals = sum(1 for t in self._paper_trades if t['direction'] == 'SELL')
+        avg_risk = sum(t['risk_budget'] for t in self._paper_trades) / len(self._paper_trades) if self._paper_trades else 0
+        
+        report_lines.extend([
+            f"BUY Signals: {buy_signals}",
+            f"SELL Signals: {sell_signals}",
+            f"Average Risk per Signal: ${avg_risk:.2f}",
+            "-" * 80,
+            "Signal Details:",
+        ])
+        
+        for i, trade in enumerate(self._paper_trades, 1):
+            report_lines.append(
+                f"{i}. {trade['time'].strftime('%Y-%m-%d %H:%M:%S')} | "
+                f"{trade['direction']:4} | Entry: {trade['entry']:.5f} | "
+                f"SL: {trade['sl']:.5f} | TP: {trade['tp']:.5f} | "
+                f"Risk: ${trade['risk_budget']:.2f}"
+            )
+        
+        report_lines.append("=" * 80)
+        
+        # Log the report
+        report_text = "\n".join(report_lines)
+        logger.info(report_text)
+        self._emit("INFO", "Paper trading report generated. Check logs for details.")
+        
+        # Save to file
+        try:
+            import os
+            reports_dir = "logs"
+            if not os.path.exists(reports_dir):
+                os.makedirs(reports_dir)
+            
+            report_file = os.path.join(reports_dir, f"paper_trading_{utc_now().strftime('%Y%m%d_%H%M%S')}.txt")
+            with open(report_file, 'w') as f:
+                f.write(report_text)
+            logger.info(f"Paper trading report saved to: {report_file}")
+        except Exception as e:
+            logger.error(f"Failed to save paper trading report: {e}")
 
     @staticmethod
     def _format_positions(positions: object, max_items: int = 3) -> str:
