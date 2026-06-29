@@ -267,9 +267,10 @@ class TradeMonitor:
             return
 
         seen: set[int] = set()
+        magic_number = int(getattr(self.cfg, "magic_number", 0) or 0)
         for pos in positions:
             magic = int(getattr(pos, "magic", 0) or 0)
-            if magic and magic != self.cfg.magic_number:
+            if magic_number and magic != magic_number:
                 continue
             ticket = int(getattr(pos, "ticket", 0) or 0)
             if not ticket:
@@ -365,19 +366,26 @@ class TradeMonitor:
         self.sync_positions_from_mt5(self.cfg.symbol.strip() or None)
         decisions: List[Tuple[int, TradeDecision]] = []
 
+        positions_by_symbol: Dict[str, list] = {}
         for ticket, trade in list(self.open_trades.items()):
             try:
-                positions = self.execution.positions(symbol=trade.symbol)
+                if trade.symbol not in positions_by_symbol:
+                    positions_by_symbol[trade.symbol] = self.execution.positions(symbol=trade.symbol)
                 pos = next(
-                    (p for p in positions if int(getattr(p, "ticket", 0)) == ticket),
+                    (p for p in positions_by_symbol[trade.symbol] if int(getattr(p, "ticket", 0)) == ticket),
                     None,
                 )
                 if pos is None:
+                    logger.info("ticket=%s missing from MT5 positions, removing tracked trade", ticket)
                     self.remove_trade(ticket)
                     continue
 
                 tick = self.client.tick(trade.symbol)
-                # Bid for longs, ask for shorts — matches MT5 profit direction
+                if tick is None or not hasattr(tick, "bid") or not hasattr(tick, "ask"):
+                    logger.warning("No tick data for %s, holding trade %s", trade.symbol, ticket)
+                    decisions.append((ticket, TradeDecision("HOLD", "No tick data", confidence=0.5)))
+                    continue
+
                 current_price = float(
                     tick.bid if trade.type == "BUY" else tick.ask
                 )

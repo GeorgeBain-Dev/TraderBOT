@@ -252,6 +252,60 @@ class RsiEmaStrategy(BaseStrategy):
         if self._trade_scorer:
             self._trade_scorer.signal_tracker = signal_tracker
 
+    def _safe_ratio(
+        self, numerator: pd.Series, denominator: pd.Series, default: float = 0.5
+    ) -> pd.Series:
+        result = numerator.div(denominator.replace(0.0, np.nan))
+        return result.fillna(default)
+
+    @staticmethod
+    def _reason_indicator_type(reason: str) -> str:
+        reason = reason.lower()
+        if "rsi" in reason or "macd" in reason or "stochastic" in reason:
+            return "momentum"
+        if "ema" in reason:
+            return "trend"
+        if "bb" in reason or "bollinger" in reason:
+            return "volatility"
+        if "volume" in reason:
+            return "volume"
+        if "support" in reason or "resistance" in reason:
+            return "price_level"
+        return "other"
+
+    @staticmethod
+    def _score_reason(reason: str) -> int:
+        text = reason.lower()
+        if any(x in text for x in [
+            "overbought rsi",
+            "oversold rsi",
+            "ema bullish crossover",
+            "ema bearish crossover",
+        ]):
+            return 3
+        if any(x in text for x in [
+            "uptrend pullback",
+            "downtrend pullback",
+            "macd bullish",
+            "macd bearish",
+            "near support",
+            "near resistance",
+            "extreme rsi",
+            "bb bounce",
+            "stochastic",
+        ]):
+            return 2
+        if "volume" in text:
+            return 1
+        return 0
+
+    def _score_reasons(self, reasons: list[str]) -> int:
+        return sum(self._score_reason(reason) for reason in reasons)
+
+    def _attempt_train_ml(self, df: pd.DataFrame) -> None:
+        if self._ml is not None and not self._ml._trained:
+            self._ml.fit(df)
+
     def set_symbol(self, symbol: str) -> None:
         """Set the current trading symbol for parameter tuning"""
         self._current_symbol = symbol
@@ -432,15 +486,21 @@ class RsiEmaStrategy(BaseStrategy):
         # Support/Resistance levels
         df["resistance"] = df["high"].rolling(window=20).max()
         df["support"] = df["low"].rolling(window=20).min()
-        df["price_position"] = (df["close"] - df["support"]) / (df["resistance"] - df["support"])  # 0-1 position in range
+        range_width = df["resistance"] - df["support"]
+        df["price_position"] = self._safe_ratio(
+            df["close"] - df["support"], range_width, default=0.5
+        )
         
         # Bollinger Band position
-        df["bb_position"] = (df["close"] - df["bb_lower"]) / (df["bb_upper"] - df["bb_lower"])  # 0-1 position in BB
-        df["bb_width"] = (df["bb_upper"] - df["bb_lower"]) / df["bb_middle"] * 100  # BB width as %
+        bb_range = df["bb_upper"] - df["bb_lower"]
+        df["bb_position"] = self._safe_ratio(
+            df["close"] - df["bb_lower"], bb_range, default=0.5
+        )
+        df["bb_width"] = self._safe_ratio(bb_range, df["bb_middle"], default=0.0) * 100
         
         # ML confirmation
         if self._ml is not None:
-            self._ml.fit(df)
+            self._attempt_train_ml(df)
             
         return df
 
@@ -734,44 +794,9 @@ class RsiEmaStrategy(BaseStrategy):
                 sell_reasons.append("Price bouncing off EMA from above")
         
         # Filter signal reasons based on proven performance with adaptive thresholds
-        filtered_buy_reasons = []
-        if self._signal_tracker and buy_reasons:
-            # Get proven signals for bonus scoring, but don't block new signals
-            volatility_adjustment = min(volatility / 3.0, 0.5)
-            min_trades_adaptive = max(10 - int(volatility_adjustment * 5), 5)
-            min_win_rate_adaptive = max(50.0 - volatility_adjustment * 10, 45.0)
-            min_profit_factor_adaptive = max(1.1 - volatility_adjustment * 0.05, 1.05)
-            
-            proven_signals = self._signal_tracker.get_proven_signals(
-                min_trades=min_trades_adaptive, 
-                min_win_rate=min_win_rate_adaptive, 
-                min_profit_factor=min_profit_factor_adaptive
-            )
-            # Allow all signals - don't block new signals (cold start fix)
-            filtered_buy_reasons = buy_reasons
-        else:
-            # No tracker = allow all signals
-            filtered_buy_reasons = buy_reasons
-        
-        filtered_sell_reasons = []
-        if self._signal_tracker and sell_reasons:
-            # Get proven signals for bonus scoring, but don't block new signals
-            volatility_adjustment = min(volatility / 3.0, 0.5)
-            min_trades_adaptive = max(10 - int(volatility_adjustment * 5), 5)
-            min_win_rate_adaptive = max(50.0 - volatility_adjustment * 10, 45.0)
-            min_profit_factor_adaptive = max(1.1 - volatility_adjustment * 0.05, 1.05)
-            
-            proven_signals = self._signal_tracker.get_proven_signals(
-                min_trades=min_trades_adaptive, 
-                min_win_rate=min_win_rate_adaptive, 
-                min_profit_factor=min_profit_factor_adaptive
-            )
-            # Allow all signals - don't block new signals (cold start fix)
-            filtered_sell_reasons = sell_reasons
-        else:
-            # No tracker = allow all signals
-            filtered_sell_reasons = sell_reasons
-        
+        filtered_buy_reasons = buy_reasons
+        filtered_sell_reasons = sell_reasons
+
         # Recalculate scores based on filtered reasons with ensemble weighting
         # Ensemble: Different indicator types get bonus for diversity
         indicator_types_buy = set()
@@ -812,19 +837,9 @@ class RsiEmaStrategy(BaseStrategy):
         diversity_bonus_buy = len(indicator_types_buy) * 0.5  # 0.5 points per unique indicator type
         diversity_bonus_sell = len(indicator_types_sell) * 0.5
         
-        filtered_buy_score = sum([
-            3 if "Oversold RSI" in r or "EMA bullish crossover" in r else
-            2 if any(x in r for x in ["uptrend pullback", "MACD bullish", "Near support", "Extreme RSI", "BB bounce", "Stochastic"]) else
-            1 if "volume" in r.lower() else 0
-            for r in filtered_buy_reasons
-        ]) + diversity_bonus_buy
+        filtered_buy_score = self._score_reasons(filtered_buy_reasons) + diversity_bonus_buy
         
-        filtered_sell_score = sum([
-            3 if "Overbought RSI" in r or "EMA bearish crossover" in r else
-            2 if any(x in r for x in ["downtrend pullback", "MACD bearish", "Near resistance", "Extreme RSI", "BB bounce", "Stochastic"]) else
-            1 if "volume" in r.lower() else 0
-            for r in filtered_sell_reasons
-        ]) + diversity_bonus_sell
+        filtered_sell_score = self._score_reasons(filtered_sell_reasons) + diversity_bonus_sell
         
         # Determine signal based on filtered score (using dynamic threshold)
         desired = Signal.HOLD
@@ -906,8 +921,8 @@ class RsiEmaStrategy(BaseStrategy):
         if self.use_multi_timeframe_confirmation and desired != Signal.HOLD and higher_tf_df is not None:
             higher_signal = self.check_higher_timeframe_signal(higher_tf_df)
             if higher_signal != desired and higher_signal != Signal.HOLD:
-                desired = Signal.HOLD
                 logger.debug(f"Multi-timeframe rejection: local={desired.value}, higher={higher_signal.value}")
+                desired = Signal.HOLD
             else:
                 logger.info(f"Multi-timeframe confirmed: {desired.value} (higher={higher_signal.value})")
         
@@ -916,13 +931,7 @@ class RsiEmaStrategy(BaseStrategy):
             self._signal_count = 1
         else:
             self._signal_count += 1
-            
-        # Require signal confirmation (1 consecutive signal for faster execution)
-        if self._signal_count < 1 and desired != Signal.HOLD:
-            desired = Signal.HOLD
-            logger.debug(f"Signal confirmation pending: {self._signal_count}/1")
-        else:
-            self._last_signal = desired
+        self._last_signal = desired
         
         # ML confirmation if enabled
         if desired != Signal.HOLD and self._ml is not None:
